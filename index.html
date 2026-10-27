@@ -22,6 +22,8 @@
   dl { display:grid; grid-template-columns:max-content 1fr; gap:8px 16px; margin:16px 0 0; }
   dt { color:var(--muted); } dd { margin:0; font-weight:500; }
   .erro { color:var(--bad); }
+  .fonte { color:var(--muted); font-size:.85rem; margin:16px 0 0; }
+  .fonte a { color:var(--accent); }
   footer { color:var(--muted); font-size:.8rem; margin-top:24px; }
 </style>
 </head>
@@ -37,7 +39,7 @@
 
   <div id="resultado"></div>
 
-  <footer>Dados públicos da Receita Federal via BrasilAPI.</footer>
+  <footer>Dados públicos da Receita Federal (BrasilAPI, Minha Receita, CNPJá, CNPJ.ws, ReceitaWS). Podem ter alguns dias de atraso em relação à Receita.</footer>
 </main>
 
 <script>
@@ -45,7 +47,6 @@ const input = document.getElementById('cnpj');
 const btn = document.getElementById('btn');
 const out = document.getElementById('resultado');
 
-// Máscara 00.000.000/0000-00
 input.addEventListener('input', () => {
   const d = input.value.replace(/\D/g, '').slice(0, 14);
   input.value = d
@@ -58,18 +59,98 @@ input.addEventListener('input', () => {
 function cnpjValido(c) {
   if (c.length !== 14 || /^(\d)\1+$/.test(c)) return false;
   const calc = (base) => {
-    let pesos = base.length === 12 ? [5,4,3,2,9,8,7,6,5,4,3,2] : [6,5,4,3,2,9,8,7,6,5,4,3,2];
-    const s = base.split('').reduce((acc, n, i) => acc + n * pesos[i], 0);
-    const r = s % 11;
+    const pesos = base.length === 12 ? [5,4,3,2,9,8,7,6,5,4,3,2] : [6,5,4,3,2,9,8,7,6,5,4,3,2];
+    const r = base.split('').reduce((a, n, i) => a + n * pesos[i], 0) % 11;
     return r < 2 ? 0 : 11 - r;
   };
   const d1 = calc(c.slice(0, 12));
-  const d2 = calc(c.slice(0, 12) + d1);
-  return c.endsWith('' + d1 + d2);
+  return c.endsWith('' + d1 + calc(c.slice(0, 12) + d1));
 }
 
 const esc = (s) => String(s ?? '—').replace(/[&<>"]/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
-const data = (s) => s ? s.split('-').reverse().join('/') : '—';
+// aceita "2005-11-03", "2005-11-03T..." ou "03/11/2005"
+const data = (s) => !s ? '—' : /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10).split('-').reverse().join('/') : s;
+
+class NaoEncontrado extends Error {}
+
+async function getJSON(url) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (res.status === 404) throw new NaoEncontrado();
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally { clearTimeout(t); }
+}
+
+// ReceitaWS não libera CORS, então usa JSONP
+function jsonp(url) {
+  return new Promise((resolve, reject) => {
+    const cb = 'cb' + Date.now() + Math.floor(Math.random() * 1e6);
+    const sc = document.createElement('script');
+    const fim = () => { delete window[cb]; sc.remove(); clearTimeout(t); };
+    const t = setTimeout(() => { fim(); reject(new Error('timeout')); }, 10000);
+    window[cb] = (d) => { fim(); resolve(d); };
+    sc.onerror = () => { fim(); reject(new Error('erro')); };
+    sc.src = url + '?callback=' + cb;
+    document.head.appendChild(sc);
+  });
+}
+
+// Cada fonte devolve o mesmo formato
+const FONTES = [
+  { nome: 'BrasilAPI', buscar: async (c) => {
+    const j = await getJSON('https://brasilapi.com.br/api/cnpj/v1/' + c);
+    return { situacao: j.descricao_situacao_cadastral, razao: j.razao_social, fantasia: j.nome_fantasia,
+      dataSit: j.data_situacao_cadastral, motivo: j.descricao_motivo_situacao_cadastral,
+      abertura: j.data_inicio_atividade, municipio: j.municipio, uf: j.uf };
+  }},
+  { nome: 'Minha Receita', buscar: async (c) => {
+    const j = await getJSON('https://minhareceita.org/' + c);
+    return { situacao: j.descricao_situacao_cadastral, razao: j.razao_social, fantasia: j.nome_fantasia,
+      dataSit: j.data_situacao_cadastral, motivo: j.descricao_motivo_situacao_cadastral,
+      abertura: j.data_inicio_atividade, municipio: j.municipio, uf: j.uf };
+  }},
+  { nome: 'CNPJá', buscar: async (c) => {
+    const j = await getJSON('https://open.cnpja.com/office/' + c);
+    return { situacao: j.status?.text, razao: j.company?.name, fantasia: j.alias,
+      dataSit: j.statusDate, motivo: j.reason?.text, abertura: j.founded,
+      municipio: j.address?.city, uf: j.address?.state, atualizado: j.updated };
+  }},
+  { nome: 'CNPJ.ws', buscar: async (c) => {
+    const j = await getJSON('https://publica.cnpj.ws/cnpj/' + c);
+    const e = j.estabelecimento || {};
+    return { situacao: e.situacao_cadastral, razao: j.razao_social, fantasia: e.nome_fantasia,
+      dataSit: e.data_situacao_cadastral, motivo: e.motivo_situacao_cadastral?.descricao,
+      abertura: e.data_inicio_atividade, municipio: e.cidade?.nome, uf: e.estado?.sigla, atualizado: j.atualizado_em };
+  }},
+  { nome: 'ReceitaWS', buscar: async (c) => {
+    const j = await jsonp('https://receitaws.com.br/v1/cnpj/' + c);
+    if (j.status === 'ERROR') {
+      if (/inv[aá]lido|n[aã]o encontrado/i.test(j.message || '')) throw new NaoEncontrado();
+      throw new Error(j.message);
+    }
+    return { situacao: j.situacao, razao: j.nome, fantasia: j.fantasia, dataSit: j.data_situacao,
+      motivo: j.motivo_situacao, abertura: j.abertura, municipio: j.municipio, uf: j.uf, atualizado: j.ultima_atualizacao };
+  }},
+];
+
+async function consultar(cnpj) {
+  let naoEncontrado = 0;
+  for (const f of FONTES) {
+    try {
+      const r = await f.buscar(cnpj);
+      if (!r.situacao || !r.razao) throw new Error('resposta incompleta');
+      return { ...r, fonte: f.nome };
+    } catch (e) {
+      if (e instanceof NaoEncontrado) naoEncontrado++;
+    }
+  }
+  throw new Error(naoEncontrado
+    ? 'CNPJ não encontrado na base da Receita.'
+    : 'Todas as fontes estão indisponíveis no momento. Tente novamente em instantes.');
+}
 
 document.getElementById('form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -81,27 +162,26 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   btn.disabled = true; btn.textContent = 'Consultando...';
   out.innerHTML = '';
   try {
-    const res = await fetch('https://brasilapi.com.br/api/cnpj/v1/' + cnpj);
-    if (res.status === 404) throw new Error('CNPJ não encontrado na base da Receita.');
-    if (!res.ok) throw new Error('Serviço indisponível no momento. Tente novamente em instantes.');
-    const j = await res.json();
-    const sit = j.descricao_situacao_cadastral || '—';
+    const j = await consultar(cnpj);
+    const sit = String(j.situacao).toUpperCase();
+    const motivo = j.motivo && !/^sem motivo$/i.test(j.motivo) ? j.motivo : '';
     out.innerHTML = `
       <div class="card">
-        <span class="status ${sit.toUpperCase() === 'ATIVA' ? 'ativa' : 'outra'}">${esc(sit)}</span>
+        <span class="status ${sit === 'ATIVA' ? 'ativa' : 'outra'}">${esc(sit)}</span>
         <dl>
-          <dt>Razão social</dt><dd>${esc(j.razao_social)}</dd>
-          <dt>Nome fantasia</dt><dd>${esc(j.nome_fantasia || '—')}</dd>
+          <dt>Razão social</dt><dd>${esc(j.razao)}</dd>
+          <dt>Nome fantasia</dt><dd>${esc(j.fantasia || '—')}</dd>
           <dt>CNPJ</dt><dd>${esc(input.value)}</dd>
-          <dt>Data da situação</dt><dd>${data(j.data_situacao_cadastral)}</dd>
-          ${j.descricao_motivo_situacao_cadastral && j.descricao_motivo_situacao_cadastral !== 'SEM MOTIVO'
-            ? `<dt>Motivo</dt><dd>${esc(j.descricao_motivo_situacao_cadastral)}</dd>` : ''}
-          <dt>Abertura</dt><dd>${data(j.data_inicio_atividade)}</dd>
+          <dt>Data da situação</dt><dd>${data(j.dataSit)}</dd>
+          ${motivo ? `<dt>Motivo</dt><dd>${esc(motivo)}</dd>` : ''}
+          <dt>Abertura</dt><dd>${data(j.abertura)}</dd>
           <dt>Município/UF</dt><dd>${esc(j.municipio)} / ${esc(j.uf)}</dd>
         </dl>
+        <p class="fonte">Fonte: ${esc(j.fonte)}${j.atualizado ? ' · base atualizada em ' + data(j.atualizado) : ''}
+          · <a href="https://solucoes.receita.fazenda.gov.br/Servicos/cnpjreva/cnpjreva_solicitacao.asp" target="_blank" rel="noopener">conferir na Receita</a></p>
       </div>`;
   } catch (err) {
-    out.innerHTML = `<div class="card erro">${esc(err.message === 'Failed to fetch' ? 'Falha de conexão. Verifique sua internet.' : err.message)}</div>`;
+    out.innerHTML = `<div class="card erro">${esc(err.message)}</div>`;
   } finally {
     btn.disabled = false; btn.textContent = 'Consultar';
   }
