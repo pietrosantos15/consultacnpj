@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consulta CNPJ</title>
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --text:#1c2430; --muted:#5f6b7a; --accent:#1f6feb; --ok:#1a7f37; --bad:#cf222e; --border:#d8dee4; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:560px; margin:48px auto; padding:0 16px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 24px; }
+  form { display:flex; gap:8px; }
+  input { flex:1; padding:12px 14px; font-size:1rem; border:1px solid var(--border); border-radius:8px; }
+  input:focus { outline:2px solid var(--accent); border-color:transparent; }
+  button { padding:12px 20px; font-size:1rem; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:wait; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:20px; margin-top:20px; }
+  .status { display:inline-block; padding:6px 12px; border-radius:999px; font-weight:600; color:#fff; }
+  .ativa { background:var(--ok); } .outra { background:var(--bad); }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:8px 16px; margin:16px 0 0; }
+  dt { color:var(--muted); } dd { margin:0; font-weight:500; }
+  .erro { color:var(--bad); }
+  footer { color:var(--muted); font-size:.8rem; margin-top:24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Consulta CNPJ</h1>
+  <p class="sub">Digite o CNPJ para ver a situação cadastral na Receita Federal.</p>
+
+  <form id="form">
+    <input id="cnpj" inputmode="numeric" placeholder="00.000.000/0000-00" maxlength="18" autocomplete="off" required>
+    <button id="btn" type="submit">Consultar</button>
+  </form>
+
+  <div id="resultado"></div>
+
+  <footer>Dados públicos da Receita Federal via BrasilAPI.</footer>
+</main>
+
+<script>
+const input = document.getElementById('cnpj');
+const btn = document.getElementById('btn');
+const out = document.getElementById('resultado');
+
+// Máscara 00.000.000/0000-00
+input.addEventListener('input', () => {
+  const d = input.value.replace(/\D/g, '').slice(0, 14);
+  input.value = d
+    .replace(/^(\d{2})(\d)/, '$1.$2')
+    .replace(/^(\d{2})\.(\d{3})(\d)/, '$1.$2.$3')
+    .replace(/\.(\d{3})(\d)/, '.$1/$2')
+    .replace(/(\d{4})(\d)/, '$1-$2');
+});
+
+function cnpjValido(c) {
+  if (c.length !== 14 || /^(\d)\1+$/.test(c)) return false;
+  const calc = (base) => {
+    let pesos = base.length === 12 ? [5,4,3,2,9,8,7,6,5,4,3,2] : [6,5,4,3,2,9,8,7,6,5,4,3,2];
+    const s = base.split('').reduce((acc, n, i) => acc + n * pesos[i], 0);
+    const r = s % 11;
+    return r < 2 ? 0 : 11 - r;
+  };
+  const d1 = calc(c.slice(0, 12));
+  const d2 = calc(c.slice(0, 12) + d1);
+  return c.endsWith('' + d1 + d2);
+}
+
+const esc = (s) => String(s ?? '—').replace(/[&<>"]/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+const data = (s) => s ? s.split('-').reverse().join('/') : '—';
+
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const cnpj = input.value.replace(/\D/g, '');
+  if (!cnpjValido(cnpj)) {
+    out.innerHTML = '<div class="card erro">CNPJ inválido. Confira os números.</div>';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Consultando...';
+  out.innerHTML = '';
+  try {
+    const res = await fetch('https://brasilapi.com.br/api/cnpj/v1/' + cnpj);
+    if (res.status === 404) throw new Error('CNPJ não encontrado na base da Receita.');
+    if (!res.ok) throw new Error('Serviço indisponível no momento. Tente novamente em instantes.');
+    const j = await res.json();
+    const sit = j.descricao_situacao_cadastral || '—';
+    out.innerHTML = `
+      <div class="card">
+        <span class="status ${sit.toUpperCase() === 'ATIVA' ? 'ativa' : 'outra'}">${esc(sit)}</span>
+        <dl>
+          <dt>Razão social</dt><dd>${esc(j.razao_social)}</dd>
+          <dt>Nome fantasia</dt><dd>${esc(j.nome_fantasia || '—')}</dd>
+          <dt>CNPJ</dt><dd>${esc(input.value)}</dd>
+          <dt>Data da situação</dt><dd>${data(j.data_situacao_cadastral)}</dd>
+          ${j.descricao_motivo_situacao_cadastral && j.descricao_motivo_situacao_cadastral !== 'SEM MOTIVO'
+            ? `<dt>Motivo</dt><dd>${esc(j.descricao_motivo_situacao_cadastral)}</dd>` : ''}
+          <dt>Abertura</dt><dd>${data(j.data_inicio_atividade)}</dd>
+          <dt>Município/UF</dt><dd>${esc(j.municipio)} / ${esc(j.uf)}</dd>
+        </dl>
+      </div>`;
+  } catch (err) {
+    out.innerHTML = `<div class="card erro">${esc(err.message === 'Failed to fetch' ? 'Falha de conexão. Verifique sua internet.' : err.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Consultar';
+  }
+});
+</script>
+</body>
+</html>
